@@ -68,11 +68,15 @@ def _find_local_arrow(cat: str):
     if not local_name:
         return None
     project_root = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(project_root)
     search_bases = [
         project_root,
         os.path.join(project_root, "dataset"),
         os.getcwd(),
         os.path.join(os.getcwd(), "dataset"),
+        parent,
+        os.path.join(parent, "gpr-recsys"),
+        os.path.join(parent, "gpr-recsys-musa"),
     ]
     for base in search_bases:
         candidate = os.path.join(base, local_name)

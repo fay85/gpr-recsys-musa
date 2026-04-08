@@ -16,6 +16,12 @@ The test ``test_mtp_one_step_matches_train_mtp_loop`` runs a single iteration us
 the same sequence as the training loop: ``to_device`` → forward → ``mtp_loss`` →
 ``zero_grad`` → ``backward`` → ``clip_grad_norm_(..., 1.0)`` → ``optimizer.step``.
 
+``test_mtp_amazon_jhan21_local_batch`` loads the real Beauty reviews Arrow tree
+(``jhan21___amazon-beauty-reviews-dataset``) when present under this repo, a
+sibling ``gpr-recsys`` checkout, or CWD — same path as ``load_amazon_reviews`` —
+then fits a one-epoch tokenizer and runs MTP forward + loss + backward on one
+``DataLoader`` batch.
+
 Run:
   python test_mtp.py
   python -m pytest test_mtp.py -v
@@ -24,9 +30,12 @@ Run:
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -47,7 +56,14 @@ except ModuleNotFoundError:
         )
 
 from config import GPRConfig, ModelConfig  # noqa: E402
+from data_utils import (  # noqa: E402
+    _find_local_arrow,
+    build_sequences,
+    create_dataloaders,
+    load_amazon_reviews,
+)
 from model import GPR, mtp_loss  # noqa: E402
+from rq_tokenizer import RQKMeansPlus  # noqa: E402
 
 
 def _mtp_device() -> torch.device:
@@ -129,6 +145,75 @@ def _make_mtp_batch(
         "seq_len": seq_len,
         "target_ids": target_ids,
     }
+
+
+def _build_real_amazon_batch_and_model_cfg(
+    device: torch.device,
+) -> Optional[Tuple[dict, ModelConfig]]:
+    """
+    End-to-end data path for local ``jhan21___amazon-beauty-reviews-dataset``
+    (same loader as ``prepare_data`` / ``train.py``): Arrow → df → tokenizer fit
+    → item2sid → ``GPRDataset`` → one ``DataLoader`` batch.
+
+    Returns None if no local Arrow tree is found (no HuggingFace fallback here).
+    """
+    if _find_local_arrow("Beauty") is None:
+        return None
+
+    cfg = GPRConfig().sync()
+    cfg.data.dataset = "amazon"
+    cfg.train.save_dir = tempfile.mkdtemp()
+    cfg.tokenizer.epochs = 1
+    cfg.train.batch_size = 4
+    cfg.train.num_workers = 0
+
+    df, item_meta = load_amazon_reviews(cfg.data)
+    if len(df) > 12_000:
+        df = (
+            df.sample(n=12_000, random_state=cfg.train.seed)
+            .sort_values(["user", "timestamp"])
+            .reset_index(drop=True)
+        )
+
+    unique_items = sorted(df["item"].unique())
+    item2idx = {item: idx for idx, item in enumerate(unique_items)}
+    cfg.model.n_items = len(unique_items)
+    cfg.model.n_users = int(df["user"].nunique())
+
+    item_embeddings = np.random.randn(
+        len(unique_items), cfg.data.item_embed_dim
+    ).astype(np.float32)
+    item_embeddings /= np.linalg.norm(item_embeddings, axis=1, keepdims=True) + 1e-8
+
+    tokenizer = RQKMeansPlus(cfg.tokenizer).to(torch.device("cpu"))
+    tokenizer.fit(item_embeddings, cfg.tokenizer)
+    all_semantic_ids = tokenizer.encode_all(item_embeddings)
+    item2sid = {
+        item: all_semantic_ids[item2idx[item]].tolist()
+        for item in unique_items
+        if item in item2idx
+    }
+
+    user_seqs = build_sequences(df, item_meta, cfg.data)
+    if len(user_seqs) < 3:
+        return None
+
+    train_loader, _ = create_dataloaders(user_seqs, item2sid, cfg)
+    try:
+        batch = next(iter(train_loader))
+    except StopIteration:
+        return None
+
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            v = v.to(device)
+            if v.is_floating_point():
+                v = v.to(torch.float32)
+            out[k] = v
+        else:
+            out[k] = v
+    return out, cfg.model
 
 
 class TestMTP(unittest.TestCase):
@@ -329,6 +414,41 @@ class TestMTP(unittest.TestCase):
             changed,
             msg="optimizer.step() should update at least one parameter (same as training)",
         )
+
+    def test_mtp_amazon_jhan21_local_batch(self):
+        """
+        One batch from the real Amazon Beauty pipeline (local ``jhan21___*`` Arrow),
+        matching ``prepare_data`` → ``GPRDataset`` layout. Skips if the dataset is
+        not present under project root, sibling ``gpr-recsys``, or CWD.
+        """
+        fixture = _build_real_amazon_batch_and_model_cfg(self.device)
+        if fixture is None:
+            self.skipTest(
+                "Local Amazon Beauty Arrow not found (expected directory "
+                "``jhan21___amazon-beauty-reviews-dataset`` with ``*-train.arrow``). "
+                "See data_utils.AMAZON_LOCAL_DIRS / _find_local_arrow search paths."
+            )
+
+        batch, model_cfg = fixture
+        model = GPR(model_cfg).to(self.device, dtype=torch.float32)
+        model.train()
+
+        result = model(batch, mode="mtp")
+        loss, metrics = mtp_loss(
+            result, batch["target_ids"], n_heads=model_cfg.n_mtp_heads
+        )
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertIn("ce_loss", metrics)
+
+        loss.backward()
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            self.assertEqual(
+                torch.isnan(p.grad).sum().item(),
+                0,
+                msg=f"NaN grad in {name} (Amazon batch)",
+            )
 
 
 if __name__ == "__main__":
