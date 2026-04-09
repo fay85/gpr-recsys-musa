@@ -4,7 +4,7 @@ A PyTorch implementation of the GPR model from ["GPR: Towards a Generative Pre-t
 
 GPR replaces the traditional multi-stage cascading pipeline (retrieval → pre-ranking → ranking) with a single end-to-end generative model for advertising recommendation.
 
-This version is adapted to run on **MUSA** (Moore Threads GPU) via `torch_musa`.
+This version is adapted to run on **MUSA** (Moore Threads GPU) via `torch_musa`, with multi-GPU **FSDP** support mirroring the CUDA sibling repo `gpr-recsys` for accuracy alignment.
 
 ## Architecture
 
@@ -41,33 +41,55 @@ pip install -r requirements.txt
 
 Ensure `torch_musa` is installed and a MUSA-capable GPU is available.
 
-## Quick Start
+## Start Training
 
-### Train with synthetic data (no download needed)
-
-```bash
-python train.py --dataset synthetic --batch_size 128
-```
-
-### Train with Amazon Reviews
+### Multi-GPU FSDP (recommended, matches CUDA version)
 
 ```bash
-python train.py --dataset amazon --batch_size 128
+torchrun --nproc_per_node=8 train.py --dataset amazon
 ```
 
-The Amazon Beauty dataset will be downloaded automatically.
+### Single-GPU fallback
+
+```bash
+python train.py --dataset amazon --no_fsdp
+```
+
+### Synthetic data (no download needed)
+
+```bash
+torchrun --nproc_per_node=8 train.py --dataset synthetic
+```
 
 ### Run individual stages
 
 ```bash
 # Stage 1: MTP pre-training
-python train.py --stage mtp --dataset synthetic
+torchrun --nproc_per_node=8 train.py --stage mtp --dataset amazon
 
 # Stage 2: VAFT (loads MTP checkpoint automatically)
-python train.py --stage vaft
+torchrun --nproc_per_node=8 train.py --stage vaft --dataset amazon
 
 # Stage 3: HEPO (loads VAFT checkpoint automatically)
-python train.py --stage hepo
+torchrun --nproc_per_node=8 train.py --stage hepo --dataset amazon
+```
+
+### Resume from checkpoint
+
+```bash
+torchrun --nproc_per_node=8 train.py --stage vaft --resume checkpoints/mtp_best.pt
+```
+
+### Override batch size or epochs
+
+```bash
+torchrun --nproc_per_node=8 train.py --dataset amazon --batch_size 32 --mtp_epochs 10
+```
+
+### Launch TensorBoard
+
+```bash
+tensorboard --logdir runs/ --port 6006
 ```
 
 ### Evaluate
@@ -76,24 +98,42 @@ python train.py --stage hepo
 python evaluate.py --checkpoint checkpoints/gpr_final.pt --dataset synthetic
 ```
 
+> **CUDA version:** The sibling repo `gpr-recsys` uses the identical model and training logic,
+> with `nccl` backend instead of `mccl`:
+> ```bash
+> torchrun --nproc_per_node=8 train.py --dataset amazon
+> ```
+
+## MUSA-Specific Workarounds
+
+This codebase includes workarounds for a known MuDNN Flash SDPA kernel crash when `seq_len=1`:
+
+- **RefiningModule** (`model.py`): Manually unrolls `TransformerEncoderLayer` with `need_weights=True` to bypass SDPA.
+- **PTD decoder** (`model.py`): `_decoder_layer_forward()` unrolls `TransformerDecoderLayer` with `need_weights=True`.
+
+These workarounds force the `bmm` attention path instead of the Flash SDPA kernel.
+
 ## Configuration
 
 All hyperparameters are in `config.py`. Key settings:
 
 ```python
-# Model size
-d_model = 128          # hidden dimension
-n_heads = 4            # attention heads
-n_layers_hsd = 4       # HSD transformer layers
-n_layers_ptd = 2       # PTD decoder layers
+# Model size (matches gpr-recsys CUDA version)
+d_model = 1024         # hidden dimension
+n_heads = 16           # attention heads
+d_ff = 4096            # feed-forward dimension
+n_layers_hsd = 24      # HSD transformer layers
+n_layers_ptd = 6       # PTD decoder layers
 n_semantic_levels = 3  # hierarchy depth
-codebook_size = 256    # codes per level
+codebook_size = 2048   # codes per level
+max_seq_len = 500      # sequence length limit
 
 # Training
+batch_size = 64        # per GPU
 mtp_epochs = 30        # Stage 1
 vaft_epochs = 15       # Stage 2
 hepo_epochs = 10       # Stage 3
-batch_size = 128
+dtype = "bfloat16"     # mixed precision
 ```
 
 ## Data Schema
@@ -116,8 +156,8 @@ gpr-recsys-musa/
 ├── config.py           # Dataclass configurations
 ├── data_utils.py       # Data loading (Amazon Reviews + synthetic)
 ├── rq_tokenizer.py     # RQ-KMeans+ semantic ID tokenizer
-├── model.py            # GPR model (HSD, PTD, HTE)
-├── train.py            # 3-stage training pipeline
+├── model.py            # GPR model (HSD, PTD, HTE) + MUSA SDPA workarounds
+├── train.py            # 3-stage training pipeline (FSDP multi-GPU)
 ├── evaluate.py         # Evaluation metrics
 ├── requirements.txt
 └── README.md
