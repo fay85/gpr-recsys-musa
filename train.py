@@ -1050,33 +1050,50 @@ def prepare_data(cfg, is_distributed=False):
     tokenizer_path = os.path.join(cfg.train.save_dir, "tokenizer.pt")
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
-    _trace("prepare_data: before tokenizer creation")
-    tokenizer = RQKMeansPlus(cfg.tokenizer).to(cfg.train.device)
-    _trace("prepare_data: tokenizer on device")
+    # Keep tokenizer on CPU for data preparation.  encode_all() is only
+    # 579 items — sub-second on CPU — and avoids 8 ranks concurrently
+    # hitting the MUSA driver during data prep (intermittent segfaults).
+    _trace("prepare_data: before tokenizer creation (CPU)")
+    tokenizer = RQKMeansPlus(cfg.tokenizer)
+    _trace("prepare_data: tokenizer created on CPU")
 
     if os.path.exists(tokenizer_path):
         print0("Loading existing tokenizer...")
         tokenizer.load(tokenizer_path)
         _trace("prepare_data: tokenizer loaded")
     else:
-        print0("Training RQ-KMeans+ tokenizer...")
-        tokenizer.fit(item_embeddings, cfg.tokenizer)
-        _trace("prepare_data: tokenizer trained")
+        print0("Training RQ-KMeans+ tokenizer (on MUSA rank 0)...")
         if is_main():
+            tok_device = torch.device("musa", local_rank())
+            tokenizer = tokenizer.to(tok_device)
+            tokenizer.fit(item_embeddings, cfg.tokenizer)
             tokenizer.save(tokenizer_path)
+            tokenizer = tokenizer.cpu()
+        _trace("prepare_data: tokenizer trained/saved")
         if is_distributed:
-            _trace("prepare_data: before tokenizer barrier")
             dist.barrier()
-            _trace("prepare_data: after tokenizer barrier")
+            if not is_main():
+                tokenizer.load(tokenizer_path)
+        _trace("prepare_data: all ranks have tokenizer")
 
+    if is_distributed:
+        _trace("prepare_data: barrier before encode_all")
+        dist.barrier()
+        _trace("prepare_data: barrier done")
+
+    _trace("prepare_data: encode_all (CPU)")
     all_semantic_ids = tokenizer.encode_all(item_embeddings)
+    _trace("prepare_data: encode_all done")
+
     item2sid = {
         item: all_semantic_ids[item2idx[item]].tolist()
         for item in unique_items
         if item in item2idx
     }
+    _trace("prepare_data: item2sid built")
 
     user_seqs = build_sequences(df, item_meta, cfg.data)
+    _trace("prepare_data: build_sequences done")
     print0(f"  Built {len(user_seqs)} user sequences")
 
     _trace("prepare_data: before create_dataloaders_distributed")
