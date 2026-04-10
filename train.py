@@ -105,6 +105,30 @@ from rq_tokenizer import RQKMeansPlus
 from model import GPR, SemanticTrie, mtp_loss, vaft_loss, HSDBlock
 
 _DBG_TRAIN = os.environ.get("GPR_DEBUG", "0") == "1"
+_TRACE = os.environ.get("GPR_TRACE", "1") == "1"
+
+
+def _trace(msg):
+    """Checkpoint-style trace: sync MUSA, print step + GPU memory, flush.
+
+    Controlled by GPR_TRACE env var (default ON for debugging).
+    The torch.musa.synchronize() ensures all queued MUSA ops finish
+    *before* the log line, so the last printed step is the true crash point.
+    """
+    if not _TRACE:
+        return
+    try:
+        torch.musa.synchronize()
+    except Exception:
+        pass
+    r = rank() if dist.is_initialized() else 0
+    try:
+        alloc = torch.musa.memory_allocated() / 1024**3
+        resv = torch.musa.memory_reserved() / 1024**3
+        mem = f"mem={alloc:.2f}/{resv:.2f}GB"
+    except Exception:
+        mem = "mem=?"
+    print(f"[rank{r}][TRACE] {msg}  ({mem})", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +200,7 @@ def wrap_model_fsdp(model, cfg):
         },
     )
 
+    _trace("wrap_model_fsdp: before FSDP()")
     model = FSDP(
         model,
         auto_wrap_policy=wrap_policy,
@@ -185,6 +210,7 @@ def wrap_model_fsdp(model, cfg):
         limit_all_gathers=True,
         use_orig_params=True,
     )
+    _trace("wrap_model_fsdp: FSDP() done")
 
     if cfg.train.activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -201,6 +227,7 @@ def wrap_model_fsdp(model, cfg):
             checkpoint_wrapper_fn=non_reentrant_wrapper,
             check_fn=lambda m: isinstance(m, (HSDBlock,)),
         )
+        _trace("wrap_model_fsdp: activation checkpointing applied")
 
     return model
 
@@ -364,11 +391,13 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
     if not is_fsdp:
         model = model.to(device=device, dtype=dtype)
 
+    _trace("train_mtp: before AdamW")
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.train.mtp_lr,
         weight_decay=cfg.train.mtp_weight_decay,
     )
+    _trace("train_mtp: after AdamW")
     scheduler = CosineAnnealingLR(
         optimizer, T_max=cfg.train.mtp_epochs, eta_min=cfg.train.mtp_lr * 0.01
     )
@@ -376,6 +405,7 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
     best_val_loss = float("inf")
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
+    _trace(f"train_mtp: entering epoch loop  n_batches={len(train_loader)}")
     for epoch in range(cfg.train.mtp_epochs):
         model.train()
         if hasattr(train_loader, "sampler") and isinstance(
@@ -392,28 +422,37 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
             desc=f"MTP Epoch {epoch+1}/{cfg.train.mtp_epochs}",
             disable=not is_main(),
         )
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  to_device")
             batch = to_device(batch, device, dtype)
 
-            if _DBG_TRAIN:
-                print(f"  [TRAIN] forward...", flush=True)
+            # Log first batch shapes once
+            if epoch == 0 and batch_idx == 0:
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        _trace(f"  batch['{k}']: shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  forward")
             result = model(batch, mode="mtp")
-            if _DBG_TRAIN:
-                print(f"  [TRAIN] loss...", flush=True)
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  mtp_loss")
             loss, metrics = mtp_loss(
                 result, batch["target_ids"], n_heads=cfg.model.n_mtp_heads
             )
 
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  zero_grad")
             optimizer.zero_grad()
-            if _DBG_TRAIN:
-                print(f"  [TRAIN] backward...", flush=True)
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  backward")
             loss.backward()
-            if _DBG_TRAIN:
-                print(f"  [TRAIN] clip+step...", flush=True)
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  clip_grad_norm")
             grad_norm = clip_grad_norm(model, 1.0, is_fsdp)
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  optimizer.step")
             optimizer.step()
-            if _DBG_TRAIN:
-                print(f"  [TRAIN] batch done, loss={loss.item():.4f}", flush=True)
+
+            _trace(f"train_mtp: epoch {epoch+1} batch {batch_idx}  done  loss={loss.item():.4f}")
 
             epoch_loss += loss.item()
             for k, v in metrics.items():
@@ -1011,18 +1050,24 @@ def prepare_data(cfg, is_distributed=False):
     tokenizer_path = os.path.join(cfg.train.save_dir, "tokenizer.pt")
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
+    _trace("prepare_data: before tokenizer creation")
     tokenizer = RQKMeansPlus(cfg.tokenizer).to(cfg.train.device)
+    _trace("prepare_data: tokenizer on device")
 
     if os.path.exists(tokenizer_path):
         print0("Loading existing tokenizer...")
         tokenizer.load(tokenizer_path)
+        _trace("prepare_data: tokenizer loaded")
     else:
         print0("Training RQ-KMeans+ tokenizer...")
         tokenizer.fit(item_embeddings, cfg.tokenizer)
+        _trace("prepare_data: tokenizer trained")
         if is_main():
             tokenizer.save(tokenizer_path)
         if is_distributed:
+            _trace("prepare_data: before tokenizer barrier")
             dist.barrier()
+            _trace("prepare_data: after tokenizer barrier")
 
     all_semantic_ids = tokenizer.encode_all(item_embeddings)
     item2sid = {
@@ -1034,6 +1079,7 @@ def prepare_data(cfg, is_distributed=False):
     user_seqs = build_sequences(df, item_meta, cfg.data)
     print0(f"  Built {len(user_seqs)} user sequences")
 
+    _trace("prepare_data: before create_dataloaders_distributed")
     train_loader, val_loader = create_dataloaders_distributed(
         user_seqs, item2sid, cfg, is_distributed
     )
@@ -1041,6 +1087,7 @@ def prepare_data(cfg, is_distributed=False):
         f"  Train: {len(train_loader.dataset)} samples, "
         f"Val: {len(val_loader.dataset)} samples"
     )
+    _trace("prepare_data: dataloaders created")
 
     trie = SemanticTrie.build_from_items(item2sid)
     all_codes_per_level = get_all_codes_per_level(
@@ -1203,35 +1250,47 @@ def main():
     print0(f"Dataset: {cfg.data.dataset}")
     print0(f"TensorBoard: {tb_log_dir}")
 
+    _trace("main: before prepare_data")
     train_loader, val_loader, extra_data = prepare_data(cfg, is_distributed)
+    _trace("main: after prepare_data")
 
+    _trace("main: before GPR()")
     model = GPR(cfg.model)
     n_params = sum(p.numel() for p in model.parameters())
     print0(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+    _trace("main: GPR created on CPU")
 
     tb.log_scalar("model/n_params_M", n_params / 1e6, step=0)
     tb.log_scalar("model/n_layers_hsd", cfg.model.n_layers_hsd, step=0)
     tb.log_scalar("model/d_model", cfg.model.d_model, step=0)
 
     if use_fsdp:
+        _trace("main: before wrap_model_fsdp")
         model = wrap_model_fsdp(model, cfg)
+        _trace("main: after wrap_model_fsdp")
         print0("Model wrapped with FSDP")
         if cfg.train.activation_checkpointing:
             print0("Activation checkpointing enabled for HSDBlock")
     else:
         device = torch.device("musa", local_rank())
         dtype = get_dtype(cfg.train.dtype)
+        _trace("main: before model.to(device)")
         model = model.to(device=device, dtype=dtype)
+        _trace("main: after model.to(device)")
 
     if args.resume:
         print0(f"Loading checkpoint: {args.resume}")
+        _trace("main: before load_checkpoint")
         load_checkpoint(model, args.resume, is_fsdp=use_fsdp)
+        _trace("main: after load_checkpoint")
 
     t0 = time.time()
 
     if args.stage in ("all", "mtp"):
+        _trace("main: before train_mtp")
         model = train_mtp(model, train_loader, val_loader, cfg, tb,
                           is_fsdp=use_fsdp, csv_log=csv_log)
+        _trace("main: after train_mtp")
 
     if args.stage in ("all", "vaft"):
         if args.stage == "vaft" and args.resume is None:
