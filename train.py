@@ -525,6 +525,9 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
             )
             print0("  -> Saved best MTP model")
 
+        torch.musa.empty_cache()
+        _trace(f"train_mtp: epoch {epoch+1} done, cache cleared")
+
     print0(f"MTP training complete. Best val loss: {best_val_loss:.4f}")
     return model
 
@@ -651,6 +654,8 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger,
                 is_fsdp=is_fsdp,
             )
             print0("  -> Saved best VAFT model")
+
+        torch.musa.empty_cache()
 
     print0(f"VAFT training complete. Best val loss: {best_val_loss:.4f}")
     return model
@@ -943,6 +948,8 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
                 is_fsdp=is_fsdp,
             )
             print0("  -> Saved best HEPO model")
+
+        torch.musa.empty_cache()
 
     print0(f"HEPO training complete. Best val loss: {best_val_loss:.4f}")
     return model
