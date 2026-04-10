@@ -163,8 +163,9 @@ def print0(*args, **kwargs):
 def setup_distributed():
     if "RANK" not in os.environ:
         return False
-    dist.init_process_group(backend="mccl")
-    torch.musa.set_device(local_rank())
+    lr = local_rank()
+    torch.musa.set_device(lr)
+    dist.init_process_group(backend="mccl", device_id=torch.device("musa", lr))
     return True
 
 
