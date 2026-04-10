@@ -37,22 +37,40 @@ import numpy as np
 import torch
 import torch_musa
 
-# Globally disable Flash / mem-efficient SDPA on MUSA.
-# MuDNN flash kernels have known crashes (seq_len=1 and others).
-# Falling back to the math implementation is slightly slower but reliable.
-for _bk in ("cuda", "musa"):
-    _mod = getattr(torch.backends, _bk, None)
-    if _mod is not None:
-        for _fn in ("enable_flash_sdp", "enable_mem_efficient_sdp"):
-            _f = getattr(_mod, _fn, None)
-            if callable(_f):
-                try:
-                    _f(False)
-                except Exception:
-                    pass
-
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# MUSA SDPA workaround: replace F.scaled_dot_product_attention with a
+# pure-math ("eager") implementation.  MuDNN Flash / MemEfficient SDPA
+# kernels segfault on certain shapes, crashing the process with no Python
+# traceback.  The eager version uses only matmul + softmax — no native
+# SDPA kernels — so it is fully reliable on any backend.
+# ---------------------------------------------------------------------------
+def _eager_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                is_causal=False, scale=None):
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = scale if scale is not None else query.size(-1) ** -0.5
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    if is_causal:
+        causal_mask = torch.ones(
+            L, S, dtype=torch.bool, device=query.device
+        ).triu(diagonal=1)
+        attn_weight = attn_weight.masked_fill(causal_mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_weight = attn_weight.masked_fill(attn_mask, float("-inf"))
+        else:
+            attn_weight = attn_weight + attn_mask
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    if dropout_p > 0.0:
+        attn_weight = torch.dropout(attn_weight, dropout_p, True)
+    return attn_weight @ value
+
+if hasattr(F, "scaled_dot_product_attention"):
+    F.scaled_dot_product_attention = _eager_sdpa
+    print("[MUSA] SDPA: patched to eager (math-only) — Flash/MemEfficient disabled")
+
 import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
