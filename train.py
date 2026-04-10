@@ -30,9 +30,27 @@ import time
 import json
 from datetime import datetime
 
+import sys
+import traceback
+
 import numpy as np
 import torch
 import torch_musa
+
+# Globally disable Flash / mem-efficient SDPA on MUSA.
+# MuDNN flash kernels have known crashes (seq_len=1 and others).
+# Falling back to the math implementation is slightly slower but reliable.
+for _bk in ("cuda", "musa"):
+    _mod = getattr(torch.backends, _bk, None)
+    if _mod is not None:
+        for _fn in ("enable_flash_sdp", "enable_mem_efficient_sdp"):
+            _f = getattr(_mod, _fn, None)
+            if callable(_f):
+                try:
+                    _f(False)
+                except Exception:
+                    pass
+
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -126,11 +144,17 @@ def wrap_model_fsdp(model, cfg):
         buffer_dtype=torch.bfloat16,
     )
 
+    # NOTE: nn.TransformerDecoderLayer is intentionally excluded.
+    # The MUSA SDPA workaround in PTD._decoder_layer_forward manually
+    # unrolls decoder-layer internals (layer.self_attn, etc.).  If FSDP
+    # individually wraps each DecoderLayer, those sub-module accesses
+    # bypass FSDP's unshard hook and hit flattened parameters, causing
+    # "Dimension out of range" errors.  PTD's 6 layers are small enough
+    # that leaving them in the root FSDP unit has negligible memory cost.
     wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             HSDBlock,
-            nn.TransformerDecoderLayer,
         },
     )
 
@@ -1226,4 +1250,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        rank = int(os.environ.get("RANK", -1))
+        print(f"\n{'='*60}", file=sys.stderr, flush=True)
+        print(f"[rank{rank}] FATAL ERROR:", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        print(f"{'='*60}\n", file=sys.stderr, flush=True)
+        raise
