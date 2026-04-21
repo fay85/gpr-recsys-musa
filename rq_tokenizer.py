@@ -26,6 +26,21 @@ from tqdm import tqdm
 from config import TokenizerConfig
 
 
+def tokenizer_checkpoint_matches_model(path: str, model: "RQKMeansPlus") -> bool:
+    """
+    Return True if ``path`` can be loaded into ``model`` with strict shapes/keys.
+    Used to skip stale tokenizer.pt from older hyperparameters or code versions.
+    """
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return False
+    expected = model.state_dict()
+    if set(state.keys()) != set(expected.keys()):
+        return False
+    return all(state[k].shape == expected[k].shape for k in expected)
+
+
 class ResidualEncoder(nn.Module):
     def __init__(self, input_dim: int, embed_dim: int):
         super().__init__()
