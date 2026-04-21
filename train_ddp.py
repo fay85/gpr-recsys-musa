@@ -1,9 +1,11 @@
 """
 GPR Training Pipeline with DDP (DistributedDataParallel) + TensorBoard.
 
-Non-FSDP version: uses plain DDP for multi-GPU training.  Each GPU holds the
-full model; only gradients are synchronized via all-reduce.  This avoids
-FSDP's parameter-sharding / resharding MCCL collectives that crash on MUSA.
+DDP matches the CUDA gpr-recsys path (`train.py --ddp`): full replica per GPU,
+`find_unused_parameters=True`, `gradient_as_bucket_view=True`, same checkpoint
+format (unwrapped `state_dict`), seeded `DistributedSampler`, and
+`TrainConfig.activation_checkpointing` + optional `--no_grad_ckpt` for
+`torch.utils.checkpoint` on HSDBlock. Backend is MCCL + MUSA (CUDA uses NCCL).
 
 Three-stage training:
   Stage 1: Pre-training with Multi-Token Prediction (MTP)
@@ -11,11 +13,11 @@ Three-stage training:
   Stage 3: Post-training with HEPO (Hierarchical Enhanced Policy Optimization)
 
 Launch:
+  torchrun --nproc_per_node=8 train.py --dataset amazon
   torchrun --nproc_per_node=8 train_ddp.py --dataset amazon
-  torchrun --nproc_per_node=4 train_ddp.py --dataset amazon --batch_size 16
 
 Single-GPU:
-  python train_ddp.py --dataset amazon
+  python train.py --dataset amazon
 """
 
 import os
@@ -139,25 +141,22 @@ def cleanup_distributed():
 
 
 # ---------------------------------------------------------------------------
-# DDP wrapping
+# DDP wrapping (same scheme as CUDA gpr-recsys train.py --ddp)
 # ---------------------------------------------------------------------------
 
+def unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+
 def wrap_model_ddp(model, device):
-    """Wrap model with DistributedDataParallel."""
     model = model.to(device)
-    model = DDP(
+    return DDP(
         model,
         device_ids=[local_rank()],
         output_device=local_rank(),
         find_unused_parameters=True,
         gradient_as_bucket_view=True,
     )
-    return model
-
-
-def unwrap_model(model):
-    """Return the underlying model whether or not it is DDP-wrapped."""
-    return model.module if isinstance(model, DDP) else model
 
 
 def enable_gradient_checkpointing(model):
@@ -193,21 +192,21 @@ def _wrap_block_for_checkpointing(block):
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint helpers (plain state_dict — no FSDP complexity)
+# Checkpoint helpers (plain state_dict — DDP unwrap matches CUDA --ddp)
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, path):
-    """Save model checkpoint. Only rank 0 writes."""
+def save_checkpoint(model, path, is_fsdp: bool = False):
+    if is_fsdp:
+        raise RuntimeError("FSDP is not used on MUSA; save_checkpoint(is_fsdp=True) is invalid.")
     if is_main():
-        state = unwrap_model(model).state_dict()
-        torch.save(state, path)
+        torch.save(unwrap_model(model).state_dict(), path)
 
 
-def load_checkpoint(model, path):
-    """Load checkpoint into model (all ranks)."""
-    raw = unwrap_model(model)
+def load_checkpoint(model, path, is_fsdp: bool = False):
+    if is_fsdp:
+        raise RuntimeError("FSDP is not used on MUSA; load_checkpoint(is_fsdp=True) is invalid.")
     state = torch.load(path, weights_only=True, map_location="cpu")
-    raw.load_state_dict(state)
+    unwrap_model(model).load_state_dict(state)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +351,9 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
             desc=f"MTP Epoch {epoch+1}/{cfg.train.mtp_epochs}",
             disable=not is_main(),
         )
+        grad_norm = 0.0
         for batch_idx, batch in enumerate(pbar):
+            did_step = False
             batch = to_device(batch, device, dtype)
 
             result = model(batch, mode="mtp")
@@ -364,9 +365,11 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
             loss_scaled.backward()
 
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = gn.item() if isinstance(gn, torch.Tensor) else float(gn)
                 optimizer.step()
                 optimizer.zero_grad()
+                did_step = True
 
             epoch_loss += loss.item()
             for k, v in metrics.items():
@@ -377,6 +380,7 @@ def train_mtp(model, train_loader, val_loader, cfg, tb: TBLogger,
                 "total_loss": loss.item(),
                 "ce_loss": metrics["ce_loss"],
                 "refine_loss": metrics["refine_loss"],
+                "grad_norm": grad_norm if did_step else 0.0,
                 "lr": optimizer.param_groups[0]["lr"],
             })
             tb.step()
@@ -475,7 +479,9 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger,
             desc=f"VAFT Epoch {epoch+1}/{cfg.train.vaft_epochs}",
             disable=not is_main(),
         )
+        grad_norm = 0.0
         for batch_idx, batch in enumerate(pbar):
+            did_step = False
             batch = to_device(batch, device, dtype)
 
             result = model(batch, mode="vaft")
@@ -488,9 +494,11 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger,
             loss_scaled.backward()
 
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = gn.item() if isinstance(gn, torch.Tensor) else float(gn)
                 optimizer.step()
                 optimizer.zero_grad()
+                did_step = True
 
             epoch_loss += loss.item()
             for k, v in metrics.items():
@@ -501,6 +509,7 @@ def train_vaft(model, train_loader, val_loader, cfg, tb: TBLogger,
                 "total_loss": loss.item(),
                 "ce_loss": metrics["ce_loss"],
                 "value_loss": metrics["value_loss"],
+                "grad_norm": grad_norm if did_step else 0.0,
                 "lr": optimizer.param_groups[0]["lr"],
             })
             tb.step()
@@ -773,15 +782,20 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
 
             value_loss = F.mse_loss(value_preds, returns.detach())
 
-            total_loss = (policy_loss + 0.5 * value_loss) / accum_steps
+            hepo_loss_sum = policy_loss + 0.5 * value_loss
+            total_loss = hepo_loss_sum / accum_steps
             total_loss.backward()
 
+            did_step = False
+            grad_norm = 0.0
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = gn.item() if isinstance(gn, torch.Tensor) else float(gn)
                 policy_optimizer.step()
                 value_optimizer.step()
                 policy_optimizer.zero_grad()
                 value_optimizer.zero_grad()
+                did_step = True
 
             avg_reward = rewards.sum(dim=-1).mean().item()
             epoch_policy_loss += policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
@@ -792,8 +806,10 @@ def train_hepo(model, train_loader, val_loader, cfg, tb: TBLogger,
             tb.log_scalars("hepo_train_step", {
                 "policy_loss": policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss,
                 "value_loss": value_loss.item(),
+                "total_loss": hepo_loss_sum.item(),
                 "avg_reward": avg_reward,
                 "avg_ratio": ratio.mean().item(),
+                "grad_norm": grad_norm if did_step else 0.0,
             })
             tb.step()
 
@@ -1059,8 +1075,16 @@ def create_dataloaders_distributed(user_seqs, item2sid, cfg, is_distributed):
         is_train=False,
     )
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
-    val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
+    train_sampler = (
+        DistributedSampler(train_ds, shuffle=True, seed=cfg.train.seed)
+        if is_distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(val_ds, shuffle=False, seed=cfg.train.seed)
+        if is_distributed
+        else None
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.train.batch_size,
@@ -1101,7 +1125,7 @@ def main():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
     parser.add_argument("--no_grad_ckpt", action="store_true",
-                        help="Disable gradient checkpointing (uses more memory)")
+                        help="Disable gradient checkpointing even if TrainConfig.activation_checkpointing is True")
     args = parser.parse_args()
 
     if args.hf_token:
@@ -1121,7 +1145,7 @@ def main():
         cfg.train.hepo_epochs = args.hepo_epochs
     cfg = cfg.sync()
 
-    set_seed(cfg.train.seed + rank(), deterministic=cfg.train.deterministic)
+    set_seed(cfg.train.seed, deterministic=cfg.train.deterministic)
 
     run_name = args.run_name or (
         f"gpr_ddp{world_size()}_{args.dataset}_{args.stage}_"
@@ -1158,7 +1182,9 @@ def main():
                 "vaft_epochs": cfg.train.vaft_epochs,
                 "vaft_lr": cfg.train.vaft_lr,
                 "hepo_epochs": cfg.train.hepo_epochs,
-                "gradient_checkpointing": not args.no_grad_ckpt,
+                "activation_checkpointing": cfg.train.activation_checkpointing,
+                "gradient_checkpointing": cfg.train.activation_checkpointing
+                and not args.no_grad_ckpt,
             }, f, indent=2)
 
     print0(f"World size: {world_size()}")
@@ -1191,8 +1217,9 @@ def main():
     alloc_gb = torch.musa.memory_allocated() / 1024**3
     print0(f"GPU memory after model load: {alloc_gb:.2f} GB")
 
-    if not args.no_grad_ckpt:
+    if cfg.train.activation_checkpointing and not args.no_grad_ckpt:
         enable_gradient_checkpointing(model)
+        print0("Gradient checkpointing enabled for HSDBlock (DDP)")
 
     if is_distributed:
         model = wrap_model_ddp(model, device)
