@@ -937,6 +937,12 @@ def evaluate_model(model, val_loader, cfg, mode="mtp"):
 def prepare_data(cfg, is_distributed=False):
     print0("Preparing data...")
 
+    # Use a fresh, seed-derived RandomState so every rank produces the
+    # SAME placeholder item embeddings (otherwise per-rank np.random
+    # state can diverge after earlier consumption, and ranks would end
+    # up with different semantic IDs even if the tokenizer is shared).
+    emb_rng = np.random.RandomState(cfg.train.seed)
+
     if cfg.data.dataset == "synthetic":
         print0("Using synthetic dataset")
         df, item_meta, item_embeddings, _ = generate_synthetic_data(cfg.data)
@@ -946,9 +952,9 @@ def prepare_data(cfg, is_distributed=False):
             df, item_meta = load_amazon_reviews(cfg.data)
             print0(f"  Loaded {len(df)} interactions, {df['item'].nunique()} items")
             n_items = df["item"].nunique()
-            item_embeddings = np.random.randn(n_items, cfg.data.item_embed_dim).astype(
-                np.float32
-            )
+            item_embeddings = emb_rng.randn(
+                n_items, cfg.data.item_embed_dim
+            ).astype(np.float32)
             item_embeddings /= np.linalg.norm(item_embeddings, axis=1, keepdims=True)
         except Exception as e:
             print0(f"  Failed to load Amazon data: {e}")
@@ -964,7 +970,7 @@ def prepare_data(cfg, is_distributed=False):
     print0(f"  {cfg.model.n_users} users, {cfg.model.n_items} items")
 
     if len(item_embeddings) < len(unique_items):
-        extra = np.random.randn(
+        extra = emb_rng.randn(
             len(unique_items) - len(item_embeddings), cfg.data.item_embed_dim
         ).astype(np.float32)
         extra /= np.linalg.norm(extra, axis=1, keepdims=True) + 1e-8

@@ -718,22 +718,32 @@ class HTE(nn.Module):
     def forward(self, intent_summary, codes):
         """
         intent_summary: [B, D] — pooled intent from HSD
-        codes:          [B, n_levels] — semantic codes
+        codes:          [B, n_levels] — semantic codes z_{1:L}
         Returns: (level_values [B, n_levels], final_value [B, 1])
+
+        Per the paper (Sec. 3.3, Eq. 10), the per-level critic is
+            V_phi(s, z_{1:l-1}),
+        i.e. the value BEFORE choosing the l-th token. We implement
+        this by accumulating a sum-pooled prefix of code embeddings
+        across levels: at level l the predictor sees [intent, sum_{<l} code_emb].
+        For l = 0 the prefix is the zero vector → V(s, empty).
         """
+        B = intent_summary.shape[0]
+        prefix = torch.zeros_like(intent_summary)
+
         level_values = []
         code_reprs = []
-
         for lvl in range(self.n_levels):
+            combined = torch.cat([intent_summary, prefix], dim=-1)
+            level_values.append(self.level_predictors[lvl](combined))
             code_emb = self.code_embed(codes[:, lvl])
             code_reprs.append(code_emb)
-            combined = torch.cat([intent_summary, code_emb], dim=-1)
-            level_values.append(self.level_predictors[lvl](combined))
+            prefix = prefix + code_emb
 
         level_values = torch.cat(level_values, dim=-1)  # [B, n_levels]
 
         all_repr = torch.cat([intent_summary] + code_reprs, dim=-1)
-        final_value = self.final_value_head(all_repr)    # [B, 1]
+        final_value = self.final_value_head(all_repr)    # [B, 1]  = V(s, z_{1:L})
 
         return level_values, final_value
 
@@ -919,16 +929,17 @@ class GPR(nn.Module):
             all_new_logprobs.append(selected)
         new_logprobs = torch.stack(all_new_logprobs, dim=1)
 
+        # value_preds[:, k, l] := V_phi(s, z_{1:l-1}) per paper Eq. 10.
+        # The new HTE.forward returns exactly that as level_values, so we
+        # can call it once per candidate (much faster than the old
+        # prefix-truncation loop).
         value_preds = torch.zeros(
             B, K, n_levels, device=device, dtype=intent.dtype,
         )
         for k_idx in range(K):
             codes_k = cand_codes[:, k_idx, :]
-            for lvl in range(n_levels):
-                partial = codes_k.clone()
-                partial[:, lvl:] = 0
-                _, fv = self.hte(intent_summary_det, partial)
-                value_preds[:, k_idx, lvl] = fv.squeeze(-1)
+            level_values, _ = self.hte(intent_summary_det, codes_k)
+            value_preds[:, k_idx, :] = level_values
 
         return {
             "new_logprobs": new_logprobs,
@@ -1071,15 +1082,19 @@ class GPR(nn.Module):
                     logits = self.ptd.code_heads[lvl](query.squeeze(1))   # [1, C]
                     log_probs = F.log_softmax(logits, dim=-1).squeeze(0)  # [C]
 
-                    # Get HTE level value for dynamic beam width
+                    # Use HTE final_value of the partial path (prefix + c) as
+                    # the value-guided bonus. The new per-level head is
+                    # V(s, z_{1:l-1}) which is identical for every candidate
+                    # at this level, so it cannot rank them; final_value
+                    # incorporates the candidate's code embedding.
                     for c in valid_codes:
                         c_tensor = torch.tensor([[c]], device=device, dtype=torch.long)
                         partial = torch.zeros(1, n_levels, device=device, dtype=torch.long)
                         for i, pc in enumerate(prefix):
                             partial[0, i] = pc
                         partial[0, lvl] = c
-                        lv, _ = self.hte(isumm_b, partial)
-                        value_bonus = lv[0, lvl].item() * 0.1
+                        _, fv = self.hte(isumm_b, partial)
+                        value_bonus = fv.squeeze().item() * 0.1
                         new_beams.append((
                             prefix + [c],
                             cum_lp + log_probs[c].item() + value_bonus,
